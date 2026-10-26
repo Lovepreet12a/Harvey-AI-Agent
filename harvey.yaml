@@ -1,0 +1,58 @@
+brain:
+  provider: codex
+  model: ""
+  reasoning_effort: medium
+persona:
+  name: MOWZIVA
+  company: MOWZIVA
+  role: Property maintenance partnerships
+  email: ""
+  linkedin: ""
+  tone: professional, local, factual, helpful
+product:
+  name: MOWZIVA property maintenance
+  description: Calgary lawn care, snow removal, seasonal and year-round property maintenance. Commercial work subject to equipment and capacity assessment.
+  pricing: Quotation after property and capacity assessment
+  key_benefits:
+    - Seasonal and monthly snow removal contracts
+    - Routine lawn mowing and maintenance
+    - Primary, backup, emergency and vacation coverage subject to availability
+    - Year-round summer lawn care and winter snow removal packages
+  objection_responses: {}
+icp:
+  industries:
+    - property management
+    - condominium management
+    - commercial property management
+    - retail plaza
+    - office building
+    - clinic
+    - landlord
+    - daycare
+    - warehouse
+  company_size: Multiple properties or recurring outdoor maintenance needs; verify rather than assume
+  titles: [Property Manager, Condominium Manager, Facilities Manager, Owner]
+  geography: ["Calgary, Alberta, Canada"]
+  geo_coordinates:
+    "Calgary, Alberta, Canada": "51.0447,-114.0719,35"
+channels:
+  email:
+    enabled: false
+    provider: gmail
+    max_daily_sends: 0
+    require_approval: true
+  linkedin:
+    enabled: false
+usage:
+  quiet_hours:
+    start: "20:00"
+    end: "08:00"
+    timezone: America/Edmonton
+compliance:
+  postal_address: ""
+  do_not_contact: []
+  precleared:
+    enabled: false  # Upstream Precleared supports GB/US senders only; use the MOWZIVA CASL review gate.
+    sender_country: ""
+    prospect_country: CA
+    address_source: published
