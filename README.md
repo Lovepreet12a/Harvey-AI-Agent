@@ -2,7 +2,13 @@
 
 A customized [Harvey](https://github.com/ethanplusai/harvey) workspace for MOWZIVA's Calgary lawn care, snow removal and seasonal property maintenance business. Uses **OpenAI Codex with a ChatGPT subscription**, not Claude or separately billed OpenAI APIs.
 
-**No outbound messaging runs.** The MOWZIVA application has no send endpoint, scheduler, mailbox integration or background sales loop. Email and LinkedIn are disabled in `harvey.yaml`; the email cap is zero. Discovery and research happen only when requested. No business has been contacted during development.
+**No outbound messaging runs.** The MOWZIVA application has no send endpoint, outreach scheduler, mailbox integration or background sales loop. Email and LinkedIn are disabled in `harvey.yaml`; the email cap is zero. Research can run in bounded batches and on an explicitly enabled local schedule; scheduling is disabled by default. No business has been contacted during development.
+
+## Automated batch research upgrade
+
+Use **Research Leads** to discover candidates, corroborate official websites, read bounded public source pages, extract published business contacts/role context, qualify leads, request capped Codex opinions and prepare unsent factual drafts. Jobs expose progress, per-lead explanations, cancellation and history. Failed or incomplete leads do not halt unrelated research. Existing leads, notes, consent records and drafts are retained.
+
+See [Batch architecture, sources, costs and limits](docs/AUTONOMOUS_RESEARCH.md), [Update Ubuntu WSL2 safely](docs/WSL2_UPGRADE.md), and [upgrade validation](docs/RESEARCH_VALIDATION.md). Serper search is optional and consumes provider credits; no paid OpenAI API or Claude fallback is introduced. Scheduled research is opt-in and works only while the computer and service run.
 
 ## Run locally
 

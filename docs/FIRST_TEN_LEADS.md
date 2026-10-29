@@ -1,5 +1,7 @@
 # First 10 verified Calgary business leads
 
+For the 2026-10-29 batch research upgrade, see [AUTONOMOUS_RESEARCH.md](AUTONOMOUS_RESEARCH.md), [RESEARCH_VALIDATION.md](RESEARCH_VALIDATION.md), and [WSL2_UPGRADE.md](WSL2_UPGRADE.md). Earlier manual-workflow instructions remain available below.
+
 No step below sends an email, submits a contact form, registers with a vendor portal, or initiates LinkedIn outreach. Source research is distinct from contacting a business.
 
 ## 1. Start the review branch

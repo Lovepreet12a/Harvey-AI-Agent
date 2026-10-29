@@ -9,19 +9,15 @@ import json
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 import aiosqlite
-import httpx
-from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from harvey.brain import Brain
-from harvey.collectors.discover import (
-    DiscoveryQuery, OpenStreetMap, normalize_domain, run_discovery,
-)
+from harvey.collectors.discover import normalize_domain, is_junk
 from harvey.config import load_config
 from harvey.dashboard_auth import DashboardGuard, TokenStore
 from harvey.models import Company
@@ -29,6 +25,7 @@ from harvey.paths import PROJECT_ROOT
 from harvey.public_http import public_http_client
 from harvey.signals import seed_signal_catalog
 from harvey.state import StateManager
+from harvey.research import BatchRequest, ScheduleRequest
 
 STAGES = ('new', 'researching', 'qualified', 'draft_ready', 'approved_for_manual_contact',
           'contacted_manually', 'follow_up', 'won', 'lost', 'do_not_contact')
@@ -42,7 +39,8 @@ PUBLIC_NOTICE = ('Research only. Public contact details are not CASL consent. '
                  'No message is sent by this application. Commercial work requires capacity assessment.')
 COLUMNS = ('id', 'name', 'website', 'phone', 'location', 'industry', 'source_url',
            'verification', 'score', 'reasons', 'stage', 'contact_url', 'vendor_url',
-           'casl_basis', 'casl_evidence', 'follow_up_on', 'notes', 'draft', 'checked_at')
+           'casl_basis', 'casl_evidence', 'follow_up_on', 'notes', 'draft', 'checked_at',
+    'research_status', 'research_reason', 'sources', 'professional_contacts')
 
 
 def now():
@@ -165,9 +163,9 @@ def qualify(row: dict) -> tuple[int, list[str]]:
     """Transparent research priority, never inferred purchase intent or consent."""
     score, reasons = 0, []
     location = (row.get('location') or '').lower()
-    if 'calgary' in location:
+    if 'calgary' in location or (row.get('verification') == 'website_checked' and 'calgary' in (row.get('evidence') or '').lower()):
         score += 25
-        reasons.append('Calgary location recorded; confirm service property address')
+        reasons.append('Calgary referenced in location or verified website; confirm service property address')
     else:
         reasons.append('Calgary service area unverified')
     industry = (row.get('industry') or '').lower().replace('_', ' ')
@@ -175,11 +173,12 @@ def qualify(row: dict) -> tuple[int, list[str]]:
     if matching:
         score += max(matching)
         reasons.append('Target business category recorded')
-    if any(area in location for area in PRIORITY_AREAS) or any(
-        word in location for word in (' se ', ' ne ', 'southeast', 'northeast')
+    area_evidence = location + (' ' + (row.get('evidence') or '').lower() if row.get('verification') == 'website_checked' else '')
+    if any(area in area_evidence for area in PRIORITY_AREAS) or any(
+        word in area_evidence for word in (' se ', ' ne ', 'southeast', 'northeast')
     ):
         score += 10
-        reasons.append('Priority SE/NE area recorded')
+        reasons.append('Priority SE/NE area referenced; confirm actual service-property locations')
     if row.get('verification') == 'website_checked':
         score += 15
         reasons.append('Business website retrieved; source evidence retained')
@@ -196,6 +195,8 @@ class Workspace:
     def __init__(self, db_path=None):
         self.state = StateManager(db_path=db_path)
         self.busy = asyncio.Lock()
+        from harvey.research import SourceResearch
+        self.researcher = SourceResearch(self, lambda **kwargs: public_http_client(**kwargs))
 
     async def init(self):
         await self.state.init_db()
@@ -209,6 +210,10 @@ class Workspace:
                 checked_at TEXT NOT NULL DEFAULT '', draft TEXT NOT NULL DEFAULT '',
                 ai_review TEXT NOT NULL DEFAULT '')''')
             await db.commit()
+        from harvey.research import SCHEMA
+        async with aiosqlite.connect(self.state.db_path) as db:
+            await db.executescript(SCHEMA)
+            await db.commit()
         await self.state.set_setting('sending_paused', 'MOWZIVA research-only workspace')
 
     async def rows(self, search='', stage='', min_score=0):
@@ -219,14 +224,28 @@ class Workspace:
                 r.checked_at, r.draft, r.ai_review, r.notes AS review_notes
                 FROM companies c LEFT JOIN mowziva_reviews r ON c.id=r.company_id''')
             rows = [dict(r) for r in await cursor.fetchall()]
+        async with aiosqlite.connect(self.state.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            research = {r['company_id']: dict(r) for r in await (await db.execute('SELECT * FROM research_leads')).fetchall()}
         result = []
         for row in rows:
+            detail = research.get(row['id'], {})
+            row['research_status'] = detail.get('status', 'discovered')
+            row['research_reason'] = detail.get('reason', '')
+            row['retryable'] = bool(detail.get('retryable', False))
+            row['sources'] = json.loads(detail.get('sources', '[]'))
+            row['professional_contacts'] = json.loads(detail.get('contacts', '[]'))
             row['stage'] = row['stage'] or 'new'
             row['verification'] = row['verification'] or 'unverified'
             row['casl_basis'] = row['casl_basis'] or 'unconfirmed'
             row['notes'] = row.pop('review_notes') or ''
+            for field in ('contact_url', 'vendor_url', 'casl_evidence', 'follow_up_on', 'evidence', 'checked_at', 'draft', 'ai_review'):
+                row[field] = row.get(field) or ''
             row['score'], row['reasons'] = qualify(row)
-            row['qualified'] = (row['score'] >= 60 and row['verification'] == 'website_checked'
+            if row['stage'] == 'do_not_contact' or row['casl_basis'] == 'do_not_contact':
+                row['research_status'] = 'do_not_contact'
+            row['qualified'] = (
+                                not ('airdrie' in row['location'].lower() and 'calgary' not in row['location'].lower()) and row['score'] >= 60 and row['verification'] == 'website_checked'
                                 and 'calgary' in (row.get('evidence') or '').lower()
                                 and category_evidence(row)
                                 and row['stage'] != 'do_not_contact'
@@ -265,79 +284,50 @@ class Workspace:
         return await self.state.add_company(company)
 
     async def discover(self, request: DiscoverInput):
-        # Extend upstream's deliberately narrow OSM vocabulary for MOWZIVA's buyers.
-        OpenStreetMap.TAG_MAP.update({
-            'property management': ['office=property_management'],
-            'condominium management': ['office=property_management'],
-            'retail plaza': ['shop=mall'], 'office building': ['building=office'],
-            'clinic': ['amenity=clinic'], 'daycare': ['amenity=childcare'],
-            'warehouse': ['building=warehouse'],
-        })
-        if request.provider == 'osm' and request.segment == 'landlord':
-            raise HTTPException(422, 'OSM does not reliably identify landlords. Use public-source import or Serper.')
-        # Condo/commercial management use the property-management tag; qualification stays evidence-based.
-        term = request.segment
-        if request.provider == 'osm' and 'management' in term:
-            term = 'property management'
+        from harvey.research import ResearchService, ResearchError
         await seed_signal_catalog(self.state)
-        # Only free business-presence signals, no paid enrichment or people search.
         for code in ('FOUND_IN_SERP', 'NO_WEBSITE'):
             await self.state.set_signal_status(code, 'confirmed')
-        queries = [DiscoveryQuery(term=term, location='Calgary, Alberta, Canada',
-                                  coordinate='51.0447,-114.0719,35', depth=request.limit,
-                                  limit=request.limit)]
-        report = await run_discovery(self.state, load_config(), request.provider, queries,
-                                     max_spend=0.01)
-        from dataclasses import asdict
-        return asdict(report)
+        options = BatchRequest(provider=request.provider, segments=[request.segment], limit=request.limit,
+                               max_search_calls=1, max_estimated_cost=0.01, use_codex=False)
+        self.researcher.options = options
+        self.researcher.search_calls = 0
+        before = {r['id'] for r in await self.rows()}
+        try:
+            ids = await ResearchService(self).discover(options)
+        except ResearchError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        return {'provider': request.provider, 'queries': 1, 'found': len(ids),
+                'new_companies': len(set(ids)-before), 'known_companies': len(set(ids)&before),
+                'search_calls': self.researcher.search_calls, 'errors': [], 'stopped': ''}
 
     async def verify(self, ident):
+        from harvey.research import ResearchError
         row = await self.lead(ident)
-        if not row['website']:
-            raise HTTPException(422, 'Add a business website before verification')
+        if row['stage'] == 'do_not_contact' or row['casl_basis'] == 'do_not_contact':
+            raise HTTPException(409, 'This business is marked do not contact')
         try:
-            async with public_http_client(timeout=15) as client:
-                async with client.stream('GET', public_url(row['website'])) as response:
-                    response.raise_for_status()
-                    final_url = str(response.url)
-                    if normalize_domain(final_url).removeprefix('www.') != row['domain'].removeprefix('www.'):
-                        raise ValueError('Website redirects to another domain; review the business identity')
-                    if 'html' not in response.headers.get('content-type', ''):
-                        raise ValueError('Website did not return an HTML page')
-                    chunks, size = [], 0
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > 1_000_000:
-                            raise ValueError('Website exceeds research size limit')
-                        chunks.append(chunk)
-            soup = BeautifulSoup(b''.join(chunks), 'html.parser')
-            for tag in soup(['script', 'style']):
-                tag.decompose()
-            text = soup.get_text(' ', strip=True)[:16000]
-            if len(text) < 80 or row['name'].lower().split()[0] not in text.lower():
-                raise ValueError('Business identity not found on page; manual research required')
-            links = {}
-            for anchor in soup.find_all('a', href=True):
-                label = anchor.get_text(' ', strip=True).lower()
-                url = urljoin(final_url, anchor['href'])
-                if normalize_domain(url) != row['domain']:
-                    continue
-                if 'contact' in label:
-                    links.setdefault('contact_url', public_url(url))
-                if any(word in label for word in ('vendor', 'supplier', 'procurement')):
-                    links.setdefault('vendor_url', public_url(url))
-            await self.save(ident, verification='website_checked', evidence=text,
-                            checked_at=now(), **links)
-        except (httpx.HTTPError, ValueError) as exc:
-            await self.save(ident, verification='verification_failed', checked_at=now())
-            raise HTTPException(502, f'Website verification failed: {type(exc).__name__}. '
-                                'Check the public URL and network access; no evidence was inferred.') from exc
-        return await self.lead(ident)
+            if not row['website'] or is_junk(row['domain']):
+                raise ResearchError('No official website recorded. Use Research Leads with explicitly enabled Serper website resolution, or supply a reliable official source. Manual verification does not spend search credits.')
+            return await self.researcher.verify(ident)
+        except ResearchError as exc:
+            await self.save(ident, verification='verification_failed')
+            await self.researcher.state(ident, 'research_incomplete', str(exc), exc.retryable)
+            raise HTTPException(502, str(exc)) from exc
 
-    async def ai_review(self, ident):
+    async def ai_review(self, ident, include_airdrie=False):
         row = await self.lead(ident)
-        if row['verification'] != 'website_checked':
-            raise HTTPException(422, 'Verify the business website before requesting Codex review')
+        from harvey.research import in_area
+        if row['stage'] == 'do_not_contact' or row['casl_basis'] == 'do_not_contact':
+            raise HTTPException(409, 'This business is marked do not contact')
+        if row['verification'] != 'website_checked' or not category_evidence(row) or len(row.get('evidence') or '') < 80 or not in_area(row, include_airdrie):
+            reason = 'Research incomplete: insufficient verified official website, business category or service-area evidence. Run Research Leads or Verify website first; no Codex usage was consumed.'
+            await self.researcher.state(ident, 'research_incomplete', reason)
+            row = await self.lead(ident)
+            row['action_result'] = {'status': 'research_incomplete', 'reason': reason}
+            return row
+        if row['stage'] == 'do_not_contact' or row['casl_basis'] == 'do_not_contact':
+            raise HTTPException(409, 'This business is marked do not contact')
         config = load_config()
         if config.brain.provider != 'codex':
             raise HTTPException(409, 'MOWZIVA requires Codex; no alternative model is used')
@@ -358,23 +348,38 @@ and next_research_step. Do not draft or send messages.\n''' + json.dumps({
         result = await brain.think_json(prompt, agent='mowziva', task='qualify')
         if not isinstance(result, dict) or not isinstance(result.get('fit_summary'), str):
             raise HTTPException(503, 'Codex did not return a usable review; retry after checking provider status')
+        # Only exact source quotations can be labelled evidence; model opinions stay opinions.
+        quotes = result.get('evidence', [])
+        result['evidence'] = [q for q in quotes if isinstance(q, str) and q in row['evidence']] if isinstance(quotes, list) else []
         # AI opinions do not change deterministic scores, verification or pipeline stages.
         await self.save(ident, ai_review=json.dumps(result, ensure_ascii=False))
         return await self.lead(ident)
 
-    async def draft(self, ident):
+    async def draft(self, ident, preserve_stage=False):
         row = await self.lead(ident)
         if row['stage'] == 'do_not_contact' or row['casl_basis'] == 'do_not_contact':
             raise HTTPException(409, 'This business is marked do not contact')
         if row['verification'] != 'website_checked':
             raise HTTPException(422, 'Verify the website before preparing a draft')
         # Deterministic factual draft: the model cannot add unapproved company credentials.
+        verified_context = ''
+        if category_evidence(row):
+            phrases = ('property management', 'rental management', 'condominium', 'townhouse',
+                       'commercial property', 'retail plaza', 'office building', 'clinic', 'landlord',
+                       'daycare', 'childcare', 'warehouse')
+            reference = next((p for p in phrases if p in row['evidence'].lower()), None)
+            if reference:
+                verified_context = ('Your published website references “' + reference + '”. '
+                                    'Could MOWZIVA be considered when outdoor maintenance needs arise?\n\n')
+        if row.get('vendor_url'):
+            verified_context += 'We noticed a published vendor/supplier link on your website and would like to understand your selection process.\n\n'
         text = (f"DRAFT ONLY — NOT SENT — CASL REVIEW REQUIRED\n"
                 f"Subject: Outdoor maintenance enquiry for {row['name']}\n\n"
                 f"Hello {row['name']} team,\n\n"
                 'I’m reaching out from MOWZIVA, a Calgary lawn care, snow removal and seasonal '
                 'property maintenance company. We found your business through your public website '
                 f"({row['website']}).\n\n"
+                + verified_context +
                 'Do you handle outdoor maintenance contractor selection, or could you point us to '
                 'your vendor registration process? We would welcome the opportunity to discuss '
                 'primary or backup snow removal and lawn care needs. Any commercial quotation '
@@ -385,8 +390,21 @@ and next_research_step. Do not draft or send messages.\n''' + json.dumps({
                 'BEFORE MANUAL CONTACT: verify lawful CASL basis and evidence, recipient relevance, '
                 'sender identification, mailing address, contact details and working unsubscribe mechanism. '
                 'An email publicly listed online is not blanket permission to contact it.')
-        await self.save(ident, draft=text, stage='draft_ready')
-        return await self.lead(ident)
+        # Atomic suppression check: a human can mark DNC while a batch awaits a source/model.
+        async with aiosqlite.connect(self.state.db_path) as db:
+            await db.execute('BEGIN IMMEDIATE')
+            await db.execute('INSERT OR IGNORE INTO mowziva_reviews(company_id) VALUES (?)', (ident,))
+            current = await (await db.execute('SELECT stage,casl_basis,draft FROM mowziva_reviews WHERE company_id=?', (ident,))).fetchone()
+            if 'do_not_contact' in current[:2]:
+                raise HTTPException(409, 'This business is marked do not contact')
+            retained = bool(preserve_stage and current[2])
+            if not retained:
+                stage = current[0] if preserve_stage and current[0] not in ('new', 'researching', 'draft_ready', 'approved_for_manual_contact') else 'draft_ready'
+                await db.execute('UPDATE mowziva_reviews SET draft=?,stage=? WHERE company_id=?', (text, stage, ident))
+            await db.commit()
+        row = await self.lead(ident)
+        row['draft_retained'] = retained
+        return row
 
 
 def csv_text(rows):
@@ -398,7 +416,7 @@ def csv_text(rows):
         for key in COLUMNS:
             value = row.get(key) or ''
             if isinstance(value, list):
-                value = '; '.join(value)
+                value = '; '.join(value) if all(isinstance(v, str) for v in value) else json.dumps(value, ensure_ascii=False)
             value = str(value)
             # Stop spreadsheet formulas even with leading control/space characters.
             safe[key] = "'" + value if value.lstrip().startswith(('=', '+', '-', '@')) else value
@@ -408,16 +426,23 @@ def csv_text(rows):
 
 def create_app(db_path=None, token_path=None):
     workspace = Workspace(db_path)
+    from harvey.research import ResearchService, BatchRequest, ScheduleRequest, LABELS
+    research_service = ResearchService(workspace)
 
     @asynccontextmanager
     async def lifespan(app):
         await workspace.init()
-        yield
+        await research_service.init()
+        try:
+            yield
+        finally:
+            await research_service.close()
 
     app = FastAPI(title='MOWZIVA lead workspace', lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     store = TokenStore(Path(token_path or PROJECT_ROOT / 'data/mowziva-token'))
     app.add_middleware(DashboardGuard, store=store)
+    app.state.research_service = research_service
     app.state.workspace = workspace
     app.state.token_store = store
 
@@ -431,6 +456,11 @@ def create_app(db_path=None, token_path=None):
         qualified = sum(r['qualified'] for r in rows)
         return {'company': 'MOWZIVA', 'model_provider': 'codex', 'outbound_email': 'disabled',
                 'goal': 50, 'total': len(rows), 'qualified': qualified,
+                'websites_verified': sum(r['verification'] == 'website_checked' for r in rows),
+                'drafts_prepared': sum(bool(r.get('draft')) for r in rows),
+                'research_failed': sum(r['research_status'] == 'research_incomplete' for r in rows),
+                'research_retryable': sum(r['retryable'] for r in rows),
+                'research_labels': LABELS,
                 'remaining': max(0, 50-qualified), 'stages': STAGES,
                 'segments': list(SEGMENTS), 'notice': PUBLIC_NOTICE}
 
@@ -468,6 +498,30 @@ def create_app(db_path=None, token_path=None):
             review.casl_basis = 'do_not_contact'
         await workspace.save(ident, **review.model_dump())
         return await workspace.lead(ident)
+
+    @app.get('/api/research/jobs')
+    async def research_jobs():
+        return await research_service.jobs()
+
+    @app.post('/api/research/jobs', status_code=202)
+    async def research_start(options: BatchRequest):
+        return await research_service.start(options)
+
+    @app.get('/api/research/jobs/{ident}')
+    async def research_job(ident: str):
+        return await research_service.job(ident)
+
+    @app.post('/api/research/jobs/{ident}/cancel')
+    async def research_cancel(ident: str):
+        return await research_service.cancel(ident)
+
+    @app.get('/api/research/schedule')
+    async def research_schedule():
+        return await research_service.schedule()
+
+    @app.put('/api/research/schedule')
+    async def research_schedule_save(settings: ScheduleRequest):
+        return await research_service.set_schedule(settings)
 
     @app.post('/api/discover')
     async def discover(request: DiscoverInput):
