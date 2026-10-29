@@ -1,5 +1,7 @@
 # Changes awaiting review
 
+For the 2026-10-29 batch research upgrade, see [AUTONOMOUS_RESEARCH.md](AUTONOMOUS_RESEARCH.md), [RESEARCH_VALIDATION.md](RESEARCH_VALIDATION.md), and [WSL2_UPGRADE.md](WSL2_UPGRADE.md). Earlier manual-workflow instructions remain available below.
+
 The owner authorized committing and pushing this implementation on `feature/mowziva-harvey` for a pull request against `main`. The cloud environment was published by the owner. Merging and contacting businesses remain unauthorized.
 
 - Imported Harvey's MIT-licensed source, upstream tests and reference assets from `8023a9495eb46d644f03da8c8f4d2b9e41e5836e`; retained license and upstream documentation.

@@ -16,6 +16,8 @@ def client(tmp_path):
     app = create_app(str(tmp_path / 'leads.db'), tmp_path / 'token')
     with TestClient(app, base_url='http://127.0.0.1:8765') as client:
         client.headers['Authorization'] = 'Bearer ' + app.state.token_store.get()
+        app.state.workspace.researcher.delay = 0
+        app.state.workspace.researcher.retry_base = 0
         yield client
 
 
@@ -92,7 +94,10 @@ def test_no_unverified_qualified_leads_or_drafts(client):
     assert client.get('/api/status').json()['qualified'] == 0
     assert client.patch(f'/api/leads/{ident}', json={'stage': 'qualified'}).status_code == 409
     assert client.post(f'/api/leads/{ident}/draft').status_code == 422
-    assert client.post(f'/api/leads/{ident}/qualify').status_code == 422
+    response = client.post(f'/api/leads/{ident}/qualify')
+    assert response.status_code == 200
+    assert response.json()['action_result']['status'] == 'research_incomplete'
+    assert 'no Codex usage' in response.json()['action_result']['reason']
 
 
 def test_verification_draft_casl_approval_and_export(client, monkeypatch):
@@ -164,19 +169,18 @@ def test_csv_formula_injection_and_quoting():
     assert row['notes'].startswith("' \t@")
 
 
-def test_discovery_uses_upstream_with_budget(client, monkeypatch):
-    from harvey.collectors.discover import DiscoveryReport
-    async def discover(state, config, provider, queries, max_spend):
-        assert provider == 'osm'
-        assert max_spend == 0.01
-        assert queries[0].coordinate == '51.0447,-114.0719,35'
-        assert queries[0].location == 'Calgary, Alberta, Canada'
-        assert queries[0].term == 'property management'
-        assert 'FOUND_IN_SERP' in await state.confirmed_signal_codes()
-        return DiscoveryReport(provider=provider, queries=1, found=0)
-    monkeypatch.setattr('harvey.mowziva.run_discovery', discover)
+def test_discovery_uses_bounded_provider_with_budget(client, monkeypatch):
+    seen = {}
+    async def osm(self, options):
+        seen['options'] = options
+        assert options.provider == 'osm'
+        assert options.max_estimated_cost == 0.01
+        assert options.max_search_calls == 1
+        return []
+    monkeypatch.setattr('harvey.research.SourceResearch.osm', osm)
     r = client.post('/api/discover', json={'segment': 'condominium management'})
     assert r.status_code == 200 and r.json()['queries'] == 1
+    assert seen['options'].segments == ['condominium management']
     assert client.post('/api/discover', json={'provider': 'unknown'}).status_code == 422
     assert client.post('/api/discover', json={'limit': 51}).status_code == 422
 

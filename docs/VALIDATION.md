@@ -1,5 +1,7 @@
 # Validation results — 2026-10-26
 
+For the 2026-10-29 batch research upgrade, see [AUTONOMOUS_RESEARCH.md](AUTONOMOUS_RESEARCH.md), [RESEARCH_VALIDATION.md](RESEARCH_VALIDATION.md), and [WSL2_UPGRADE.md](WSL2_UPGRADE.md). Earlier manual-workflow instructions remain available below.
+
 ## Original onboarding validation (before owner publication)
 
 | Check | Actual result |
